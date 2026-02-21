@@ -1,7 +1,11 @@
 name: Build iStoreOS (Quarterly)
 
+# 修正后的权限配置（仅保留合法字段）
+permissions:
+  actions: write   # 支持上传产物、删除旧Workflow记录
+  contents: write  # 支持读写仓库内容、管理Release/Tag
+
 # 触发规则：每季度第1个月1号 UTC 0点（北京时间8点）执行 + 手动触发
-# 季度划分：1/4/7/10月1号，对应 cron 表达式：0 0 1 1,4,7,10 *
 on:
   schedule:
     - cron: '0 0 1 1,4,7,10 *'  # 季度编译：1/4/7/10月1号
@@ -33,15 +37,14 @@ jobs:
       # ===================== 步骤2：克隆源码 + 拉取更新日志 =====================
       - name: Clone Source & Get Update Log
         run: |
-          # 取消浅克隆（--depth=1），拉取完整提交记录用于生成更新日志
+          # 取消浅克隆，拉取完整提交记录用于生成更新日志
           git clone $REPO_URL -b $REPO_BRANCH /workdir/istoreos
           ln -sf /workdir/istoreos $GITHUB_WORKSPACE/istoreos
           cd /workdir/istoreos
-          # 拉取所有提交记录（确保能查到上一次编译后的更新）
+          # 拉取所有提交记录
           git fetch --all
-          # 生成更新日志：获取上一次标签/编译时间后的提交记录（先存为文件）
+          # 生成更新日志：最近90天的提交记录
           echo "===== iStoreOS 更新日志（本次编译） =====" > update_log.md
-          # 取最近90天（一个季度）的提交记录，按时间倒序
           git log --since="90 days ago" --pretty=format:"%cd - %s (%h)" --date=short >> update_log.md
           # 打印日志方便查看
           cat update_log.md
@@ -93,16 +96,15 @@ jobs:
           rm -rf bin/targets/*/*/packages
           ls -lh bin/targets/*/*/
 
-      # ===================== 步骤8：上传固件 + 更新日志（保留180天） =====================
+      # ===================== 步骤8：上传固件 + 更新日志 =====================
       - name: Upload Firmware & Update Log
         uses: actions/upload-artifact@v4
         with:
           name: iStoreOS-Firmware-Quarterly-${{ github.run_id }}-${{ env.REPO_BRANCH }}
-          # 修复：v4版本path用字符串，多个路径换行分隔（核心改这里）
           path: |
             /workdir/istoreos/bin/targets/*/*/*.img.gz
             /workdir/istoreos/update_log.md  # 同时上传更新日志
-          retention-days: 180  # 固件保留180天（6个月，覆盖两个季度）
+          retention-days: 180  # 固件保留180天（6个月）
 
       # ===================== 步骤9：清理旧 workflow 记录 =====================
       - name: Clean Old Workflow Runs
@@ -111,3 +113,12 @@ jobs:
           retain_days: 180     # 保留180天运行记录
           keep_minimum_runs: 4 # 至少保留4条（对应4个季度）
           github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ===================== 步骤10：清理旧 Releases（如需启用请取消注释） =====================
+      # - name: Remove Old Releases
+      #   uses: dev-drprasad/delete-older-releases@master
+      #   with:
+      #     keep_latest: 3        # 保留最新3个Release
+      #     delete_tags: true     # 同时删除对应的Tag
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
