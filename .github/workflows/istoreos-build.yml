@@ -12,7 +12,7 @@ on:
   workflow_dispatch:             # 保留手动触发，方便调试
 
 env:
-  REPO_URL: https://github.com/istoreos/istoreos
+  REPO_URL: https://github.com/Firsgith/istoreos
   REPO_BRANCH: main
   TZ: Asia/Shanghai
 
