@@ -6,11 +6,11 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 0 1 1,4,7,10 *'
-  workflow_dispatch:
+    - cron: '0 0 1 1,4,7,10 *'  # 每季度1/4/7/10月1号 北京时间8点
+  workflow_dispatch:             # 手动触发开关
 
 env:
-  REPO_URL: https://github.com/Firsgith/istoreos
+  REPO_URL: https://github.com/Firsgith/istoreos 
   REPO_BRANCH: istoreos-24.10
   TZ: Asia/Shanghai
 
@@ -19,190 +19,271 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
-      # ===================== 步骤1：安全清理 + 修复源 + 屏蔽警告 =====================
-      - name: Clean System & Fix Sources (No Warnings)
+      # ===================== 步骤1：环境初始化 + 磁盘清理 =====================
+      - name: Env Init & Disk Cleanup
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 屏蔽所有无关警告（重定向stderr到stdout，仅保留致命错误）
-          set +e
-          # 删除冗余大文件（安全）
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1
-          # 安全清理，屏蔽目录非空警告
-          sudo apt-get autoremove -y --purge > /dev/null 2>&1
-          sudo apt-get clean > /dev/null 2>&1
-          sudo rm -rf /var/lib/apt/lists/* /var/log/* /tmp/*
-          # 切换到官方Ubuntu源（解决Azure源缺失which包问题）
-          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-          sudo echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list
-          sudo echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse" >> /etc/apt/sources.list
-          # 修复依赖，屏蔽apt CLI警告
-          sudo apt-get update --fix-missing -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
-          sudo apt-get -f install -y -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
-          set -e
+          # 系统清理（必须，GitHub Actions只有14GB）
+          echo "===== 清理系统空间 ====="
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android /usr/local/share/chromedriver-linux64
+          docker rmi $(docker images -q) 2>/dev/null || true
+          
+          # 修复apt
+          sudo apt-get update --fix-missing -o APT::Get::Show-User-Simulation-Note=no
+          sudo apt-get -f install -y -o APT::Get::Show-User-Simulation-Note=no
+          sudo apt-get autoremove -y
+          
           # 创建工作目录
           sudo mkdir -p /workdir && sudo chown $USER:$GROUPS /workdir
-          df -hT /workdir
+          
+          echo "===== 当前磁盘空间 ====="
+          df -hT /
 
       # ===================== 步骤2：克隆源码 =====================
-      - name: Clone iStoreOS Source Code
+      - name: Clone iStoreOS Source
         run: |
           git clone $REPO_URL -b $REPO_BRANCH /workdir/istoreos
-          ln -sf /workdir/istoreos $GITHUB_WORKSPACE/istoreos
           cd /workdir/istoreos
-          echo "当前编译分支："
-          git branch -v
+          echo "当前编译分支：$(git branch -v)"
 
-      # ===================== 步骤3：安装依赖（移除which，通过coreutils替代） =====================
-      - name: Install Build Dependencies (Fixed - No 'which' Package)
+      # ===================== 步骤3：强制加载自定义.config =====================
+      - name: Load Custom .config
         run: |
-          # 屏蔽apt CLI警告，强制更新源
-          sudo apt-get update --fix-missing -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
-          sudo apt-get -f install -y -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
-          # 安装依赖（移除which，coreutils/util-linux已包含which命令）
+          CONFIG_SRC="$GITHUB_WORKSPACE/.config"
+          CONFIG_DST="/workdir/istoreos/.config"
+          
+          echo "===== 验证自定义.config ====="
+          ls -la $GITHUB_WORKSPACE/
+          
+          if [ -f "$CONFIG_SRC" ]; then
+            cp -f "$CONFIG_SRC" "$CONFIG_DST"
+            echo "✅ 已加载自定义.config"
+            cat "$CONFIG_DST" | grep -E 'TARGET_|CONFIG_PACKAGE_istore' | head -10
+            # 展开配置（关键：确保依赖完整）
+            cd /workdir/istoreos
+            make defconfig
+          else
+            echo "⚠️ 未找到自定义.config，使用默认配置"
+            cd /workdir/istoreos
+            make defconfig
+          fi
+
+      # ===================== 步骤4：安装编译依赖（修复Python 3.10兼容性）=====================
+      - name: Install Build Dependencies
+        run: |
+          # python3-distutils 在 Ubuntu 22.04+ 已移除，使用 python3-pyelftools 替代
           sudo apt-get install -y -o APT::Get::Show-User-Simulation-Note=no \
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
-            rsync swig unzip zlib1g-dev file wget \
+            gettext git libncurses-dev libssl-dev python3-pyelftools python3-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget \
             diffutils findutils util-linux coreutils pkg-config patch
-          # 验证核心命令（包括which，通过util-linux提供）
           echo "===== 核心命令验证 ====="
           command -v gettext && echo "gettext ✅" || echo "gettext ❌"
-          command -v diff && echo "diff ✅" || echo "diff ❌"
-          command -v getopt && echo "getopt ✅" || echo "getopt ❌"
           command -v which && echo "which ✅" || echo "which ❌"
-          command -v gcc && echo "gcc ✅" || echo "gcc ❌"
-          # 验证版本
-          echo "===== 关键依赖版本 ====="
-          gcc --version | head -1
-          make --version | head -1
-          python3 --version
 
-      # ===================== 步骤4：更新Feeds + 加载.config =====================
-      - name: Update Feeds & Load Custom .config
+      # ===================== 步骤5：更新Feeds =====================
+      - name: Update Feeds
         run: |
           cd /workdir/istoreos
           ./scripts/feeds update -a && ./scripts/feeds install -a
-          if [ -f "$GITHUB_WORKSPACE/.config" ]; then
-            cp $GITHUB_WORKSPACE/.config ./
-            make defconfig
-            echo "===== 自定义.config加载成功 ====="
-            cat .config | grep -E 'TARGET_|CONFIG_PACKAGE_istore' | head -10
-          else
-            echo "===== 未找到自定义.config，使用默认配置 ====="
-            make defconfig
-          fi
 
-      # ===================== 步骤5：下载依赖包（容错） =====================
-      - name: Download Dependencies (Error Handling)
+      # ===================== 步骤6：下载依赖包 =====================
+      - name: Download Dependencies
         run: |
           cd /workdir/istoreos
-          echo "===== 开始下载依赖包（8线程） ====="
-          if ! make download -j8; then
-            echo "===== 下载出错，单线程+详细日志重新下载 ====="
+          echo "===== 8线程下载依赖包 ====="
+          make download -j8 2>&1 | tee download.log || {
+            echo "⚠️ 下载出错，单线程重试"
             make download -j1 V=s 2>&1 | tee download_error.log
-            grep -E 'error:|Failed|404|timeout' download_error.log | tail -20
-            echo "===== 最终重试下载 ====="
-            make download -j1 || echo "===== 下载仍失败，请检查网络/源地址 ====="
-          fi
-          find dl -size -1024c -exec rm -f {} \;
-          echo "===== 依赖包下载完成，dl目录大小 ====="
-          du -sh dl/
-          df -hT /workdir
-
-      # ===================== 步骤6：编译工具链 =====================
-      - name: Build Toolchain (Clean→Compile→Install)
-        run: |
-          cd /workdir/istoreos
-          CORES=$(nproc)
-          USE_CORES=$((CORES - 1))
-          echo "===== 编译工具链（总核心$CORES，使用$USE_CORES核心） ====="
-          
-          make toolchain/clean
-          if ! make toolchain/compile -j$USE_CORES; then
-            echo "===== 工具链编译出错，单线程+详细日志 ====="
-            make toolchain/compile -j1 V=s 2>&1 | tee toolchain_error.log
-            grep -E 'error:|Failed' toolchain_error.log | tail -20
-            exit 1
-          fi
-          if ! make toolchain/install -j$USE_CORES; then
-            echo "===== 工具链安装出错，单线程+详细日志 ====="
-            make toolchain/install -j1 V=s 2>&1 | tee toolchain_error.log
-            grep -E 'error:|Failed' toolchain_error.log | tail -20
-            exit 1
-          fi
-          
-          rm -rf build_dir/toolchain tmp/toolchain logs/toolchain
-          df -hT /workdir
-
-      # ===================== 步骤7：编译固件 =====================
-      - name: Build Firmware (Full Clean→Compile→Install)
-        run: |
-          cd /workdir/istoreos
-          CORES=$(nproc)
-          USE_CORES=$((CORES - 1))
-          echo "===== 固件编译（总核心$CORES，使用$USE_CORES核心） ====="
-          
-          run_with_fault_tolerance() {
-            local target=$1
-            local log_file=$2
-            echo "===== 处理环节：$target ====="
-            
-            make $target/clean
-            if ! make $target/compile -j$USE_CORES; then
-              echo "===== [$target compile] 出错，单线程+详细日志 ====="
-              make $target/compile -j1 V=s 2>&1 | tee $log_file
-              grep -E 'error:|Failed' $log_file | tail -20
-              return 1
-            fi
-            if ! make $target/install -j$USE_CORES; then
-              echo "===== [$target install] 出错，单线程+详细日志 ====="
-              make $target/install -j1 V=s 2>&1 | tee $log_file
-              grep -E 'error:|Failed' $log_file | tail -20
-              return 1
-            fi
-            return 0
           }
+          find dl -size -1024c -exec rm -f {} \;
+          echo "===== 依赖包下载完成，dl目录大小：$(du -sh dl/) ====="
+
+      # ===================== 步骤7：编译工具链（修正：不clean，阶段后清理空间）=====================
+      - name: Build Toolchain
+        run: |
+          cd /workdir/istoreos
+          CORES=$(nproc)
+          USE_CORES=$((CORES - 1))
           
-          if ! run_with_fault_tolerance "kernel" "kernel_error.log"; then exit 1; fi
-          if ! run_with_fault_tolerance "package" "package_error.log"; then exit 1; fi
-          if ! run_with_fault_tolerance "target" "install_error.log"; then exit 1; fi
+          echo "===== 编译工具链（使用 $USE_CORES 核心） ====="
+          # 关键修复：不再执行 make toolchain/clean，直接编译
+          set -o pipefail
+          if ! make toolchain/compile -j$USE_CORES 2>&1 | tee toolchain.log; then
+            echo "⚠️ 工具链编译出错，单线程V=s重试"
+            make toolchain/compile -j1 V=s 2>&1 | tee toolchain_error.log
+            grep -E 'error:|Failed|ERROR:' toolchain_error.log | tail -20
+            exit 1
+          fi
+          make toolchain/install -j$USE_CORES
+          set +o pipefail
           
-          echo "===== 固件编译成功！ ====="
-          rm -rf build_dir/target tmp/target logs/target staging_dir/target
+          echo "===== 工具链完成，清理中间文件释放空间 ====="
+          df -hT /
+          # 只删 build_dir 中的编译目录，保留 staging_dir/toolchain（已安装的成果）
+          rm -rf build_dir/toolchain-* build_dir/host build_dir/hostpkg
+          df -hT /
+
+      # ===================== 步骤8：编译内核（修正：不clean）=====================
+      - name: Build Kernel
+        run: |
+          cd /workdir/istoreos
+          CORES=$(nproc)
+          USE_CORES=$((CORES - 1))
+          
+          echo "===== 编译内核（使用 $USE_CORES 核心） ====="
+          set -o pipefail
+          if ! make kernel/compile -j$USE_CORES 2>&1 | tee kernel.log; then
+            echo "⚠️ 内核编译出错，单线程V=s重试"
+            make kernel/compile -j1 V=s 2>&1 | tee kernel_error.log
+            grep -E 'error:|Failed|ERROR:' kernel_error.log | tail -20
+            exit 1
+          fi
+          make kernel/install -j$USE_CORES
+          set +o pipefail
+          
+          echo "===== 内核完成，清理中间文件 ====="
+          rm -rf build_dir/linux-* build_dir/target/linux
+          df -hT /
+
+      # ===================== 步骤9：编译包（保留原版重试逻辑，修正clean问题）=====================
+      - name: Build Packages (Parallel + Serial Retry)
+        run: |
+          cd /workdir/istoreos
+          CORES=$(nproc)
+          USE_CORES=$((CORES - 1))
+          RETRY_SUCCESS=true
+          
+          echo "===== 第一步：并行编译所有包（使用 $USE_CORES 核心） ====="
+          # 关键修复：不再执行 make package/clean，直接编译
+          set -o pipefail
+          if ! make package/compile -j$USE_CORES 2>&1 | tee package.log; then
+            echo "===== 检测到包编译失败，开始串行精准重试 ====="
+            
+            # 提取所有出错包（去重）- 保留原版逻辑
+            FAILED_PKGS=$(grep "ERROR: package/" package.log | awk -F'/' '{print $2}' | awk '{print $1}' | uniq)
+            echo "需要重试的包列表：$FAILED_PKGS"
+            
+            # 逐个重试出错包
+            for pkg in $FAILED_PKGS; do
+              echo "===== 处理出错包：$pkg ====="
+              # 只clean特定失败的包，不是全部clean
+              make package/$pkg/clean
+              
+              if ! make package/$pkg/compile -j1 V=s 2>&1 | tee ${pkg}_retry.log; then
+                echo "❌ $pkg 重试编译失败！"
+                grep -E 'error:|Failed|ERROR:' ${pkg}_retry.log | tail -20
+                RETRY_SUCCESS=false
+              else
+                echo "✅ $pkg 重试编译成功！"
+                make package/$pkg/install -j1
+              fi
+            done
+            
+            # 最终判断
+            if [ "$RETRY_SUCCESS" = "false" ]; then
+              echo "❌ 部分包重试失败，终止编译流程"
+              exit 1
+            else
+              echo "✅ 所有出错包重试成功！"
+            fi
+          else
+            echo "✅ 所有包并行编译成功！"
+            make package/install -j$USE_CORES
+          fi
+          set +o pipefail
+          
+          echo "===== 软件包完成，清理中间文件 ====="
+          rm -rf build_dir/package/*
+          df -hT /
+
+      # ===================== 步骤10：编译固件（修正：不clean）=====================
+      - name: Build Final Firmware
+        run: |
+          cd /workdir/istoreos
+          CORES=$(nproc)
+          USE_CORES=$((CORES - 1))
+          
+          echo "===== 打包固件（使用 $USE_CORES 核心） ====="
+          set -o pipefail
+          if ! make target/compile -j$USE_CORES 2>&1 | tee target.log; then
+            echo "⚠️ 固件打包出错，单线程V=s重试"
+            make target/compile -j1 V=s 2>&1 | tee target_error.log
+            grep -E 'error:|Failed|ERROR:' target_error.log | tail -20
+            exit 1
+          fi
+          make target/install -j$USE_CORES
+          set +o pipefail
+          
+          # 最终清理：只保留固件产物
+          rm -rf build_dir/target tmp/target staging_dir/target
           rm -rf bin/targets/*/*/packages
           echo "===== 编译产物列表 ====="
           ls -lh bin/targets/*/*/
-          if ls *.log 1> /dev/null 2>&1; then cp *.log /workdir/istoreos/; fi
 
-      # ===================== 步骤8：生成更新日志 =====================
+      # ===================== 步骤11：生成更新日志 =====================
       - name: Generate Update Log
         run: |
           cd /workdir/istoreos
-          echo "# 自定义iStoreOS更新日志（${{ env.REPO_BRANCH }}分支）" > update_log.md
+          echo "# 自定义iStoreOS更新日志（${{ env.REPO_BRANCH }}）" > update_log.md
           echo "生成时间：$(date +'%Y-%m-%d %H:%M:%S')" >> update_log.md
           echo "---" >> update_log.md
           git log --since="90 days ago" --pretty=format:"- %cd: %s (%h)" --date=short >> update_log.md
-          cat update_log.md | head -20
 
-      # ===================== 步骤9：上传固件+日志 =====================
+      # ===================== 步骤12：上传固件+日志（成功时）=====================
       - name: Upload Firmware & Logs
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Custom-iStoreOS-${{ github.run_id }}-${{ env.REPO_BRANCH }}
+          name: Custom-iStoreOS-${{ github.run_id }}
           path: |
             /workdir/istoreos/bin/targets/*/*/*.img.gz
+            /workdir/istoreos/bin/targets/*/*/*.bin
             /workdir/istoreos/update_log.md
             /workdir/istoreos/*.log
-          retention-days: 180
+          retention-days: 30  # 建议30天，与清理策略一致
 
-      # ===================== 步骤10：清理旧Workflow记录 =====================
-      - name: Clean Old Workflow Runs
-        uses: Mattraks/delete-workflow-runs@main
+      # ===================== 步骤13：失败诊断（失败时执行）=====================
+      - name: Failure Diagnostics
+        if: failure()
+        run: |
+          cd /workdir/istoreos
+          echo "::error::编译失败，开始收集诊断信息..."
+          
+          echo "===== 磁盘空间状态（检查是否因空间不足失败）====="
+          df -hT /
+          
+          echo "===== 查找 config.log（通常是配置检测错误）====="
+          find build_dir -name "config.log" -type f -mmin -60 | head -5 | while read log; do
+            echo "--- $log ---"
+            tail -30 "$log"
+          done
+          
+          echo "===== 检查 staging_dir 完整性（工具链是否安装成功）====="
+          ls -la staging_dir/toolchain-*/bin/ 2>/dev/null | head -5 || echo "⚠️ toolchain 可能未正确安装"
+          
+          echo "===== 最近错误摘要 ====="
+          grep -h "error:" *.log 2>/dev/null | tail -10 || true
+
+      # ===================== 步骤14：上传失败现场（失败时）=====================
+      - name: Upload Failure Debug Info
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          retain_days: 180
-          keep_minimum_runs: 4
+          name: debug-failed-${{ github.run_id }}
+          path: |
+            /workdir/istoreos/build_dir/*/config.log
+            /workdir/istoreos/*_error.log
+            /workdir/istoreos/*_retry.log
+          retention-days: 7  # 失败调试信息保留短一点
+
+      # ===================== 步骤15：清理旧Workflow记录（始终执行）=====================
+      - name: Clean Old Workflow Runs
+        if: always()  # 关键：无论成功与否都执行清理
+        uses: Mattraks/delete-workflow-runs@v2.0.3  # 固定版本，修复安全风险
+        with:
+          retain_days: 30      # 与 artifact 保留期一致，节省存储
+          keep_minimum_runs: 4 # 至少保留4次（两次季度发布+余量）
           github_token: ${{ secrets.GITHUB_TOKEN }}
