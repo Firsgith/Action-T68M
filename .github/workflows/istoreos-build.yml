@@ -98,22 +98,20 @@ jobs:
           if [ -d "staging_dir/toolchain-"* ] && [ -f "staging_dir/host/bin/mklibs" ]; then
             echo "Toolchain缓存命中，跳过编译"
           else
-            echo "===== 编译工具链（使用 $CORES 核心） ====="
-            if ! make toolchain/compile -j$CORES 2>&1 | tee toolchain.log; then
-              echo "⚠️ 并行编译失败，尝试单线程详细输出..."
-              make toolchain/clean
-              if ! make toolchain/compile -j1 V=s 2>&1 | tee toolchain_error.log; then
-                echo "::error::Toolchain 编译失败"
-                echo "===== 错误日志最后100行 ====="
-                tail -100 toolchain_error.log
-                echo "===== 检查磁盘空间 ====="
-                df -h /
-                echo "===== 检查内存 ====="
-                free -h
-                exit 1
-              fi
+            echo "===== 编译工具链（单线程，详细输出） ====="
+            # 强制单线程 V=s，确保错误可见
+            if ! make toolchain/compile -j1 V=s 2>&1 | tee toolchain.log; then
+              echo "::error::Toolchain 编译失败"
+              echo "===== 详细错误日志 ====="
+              tail -200 toolchain.log
+              
+              # 查找 gcc/final 的具体错误
+              echo "===== 查找 gcc/final 错误 ====="
+              find build_dir/toolchain-*/gcc-* -name "config.log" -exec tail -50 {} \; 2>/dev/null || true
+              
+              exit 1
             fi
-            make toolchain/install -j$CORES
+            make toolchain/install -j1 V=s
           fi
           
           for dir in build_dir/toolchain-* build_dir/host build_dir/hostpkg; do
