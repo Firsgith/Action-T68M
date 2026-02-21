@@ -19,21 +19,29 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
+      # ===================== 步骤0：检出配置文件仓库（关键！）=====================
+      - name: Checkout Config Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史，用于生成更新日志
+
       # ===================== 步骤1：环境初始化 + 磁盘清理 =====================
       - name: Env Init & Disk Cleanup
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 系统清理（必须，GitHub Actions只有14GB）
+          # 系统清理（删除GitHub预装的臃肿软件，释放5-8GB空间）
+          # 注意：iscsid警告无害，可忽略
           echo "===== 清理系统空间 ====="
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
                       "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android /usr/local/share/chromedriver-linux64
           docker rmi $(docker images -q) 2>/dev/null || true
+          sudo apt-get remove -y --purge firefox google-chrome-stable microsoft-edge-stable 2>/dev/null || true
           
           # 修复apt
           sudo apt-get update --fix-missing -o APT::Get::Show-User-Simulation-Note=no
           sudo apt-get -f install -y -o APT::Get::Show-User-Simulation-Note=no
-          sudo apt-get autoremove -y
+          sudo apt-get autoremove -y 2>/dev/null || true
           
           # 创建工作目录
           sudo mkdir -p /workdir && sudo chown $USER:$GROUPS /workdir
@@ -41,14 +49,14 @@ jobs:
           echo "===== 当前磁盘空间 ====="
           df -hT /
 
-      # ===================== 步骤2：克隆源码 =====================
+      # ===================== 步骤2：克隆iStoreOS源码 =====================
       - name: Clone iStoreOS Source
         run: |
           git clone $REPO_URL -b $REPO_BRANCH /workdir/istoreos
           cd /workdir/istoreos
           echo "当前编译分支：$(git branch -v)"
 
-      # ===================== 步骤3：强制加载自定义.config =====================
+      # ===================== 步骤3：加载自定义.config =====================
       - name: Load Custom .config
         run: |
           CONFIG_SRC="$GITHUB_WORKSPACE/.config"
@@ -61,19 +69,19 @@ jobs:
             cp -f "$CONFIG_SRC" "$CONFIG_DST"
             echo "✅ 已加载自定义.config"
             cat "$CONFIG_DST" | grep -E 'TARGET_|CONFIG_PACKAGE_istore' | head -10
-            # 展开配置（关键：确保依赖完整）
+            # 展开配置（确保依赖完整）
             cd /workdir/istoreos
             make defconfig
           else
-            echo "⚠️ 未找到自定义.config，使用默认配置"
+            echo "⚠️ 未找到自定义.config，使用默认配置（请确保已将.config提交到GitHub仓库）"
             cd /workdir/istoreos
             make defconfig
           fi
 
-      # ===================== 步骤4：安装编译依赖（修复Python 3.10兼容性）=====================
+      # ===================== 步骤4：安装编译依赖 =====================
       - name: Install Build Dependencies
         run: |
-          # python3-distutils 在 Ubuntu 22.04+ 已移除，使用 python3-pyelftools 替代
+          # python3-distutils在Ubuntu 22.04+已移除，使用python3-pyelftools替代
           sudo apt-get install -y -o APT::Get::Show-User-Simulation-Note=no \
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-pyelftools python3-dev \
@@ -109,7 +117,6 @@ jobs:
           USE_CORES=$((CORES - 1))
           
           echo "===== 编译工具链（使用 $USE_CORES 核心） ====="
-          # 关键修复：不再执行 make toolchain/clean，直接编译
           set -o pipefail
           if ! make toolchain/compile -j$USE_CORES 2>&1 | tee toolchain.log; then
             echo "⚠️ 工具链编译出错，单线程V=s重试"
@@ -122,7 +129,7 @@ jobs:
           
           echo "===== 工具链完成，清理中间文件释放空间 ====="
           df -hT /
-          # 只删 build_dir 中的编译目录，保留 staging_dir/toolchain（已安装的成果）
+          # 关键：只删build_dir中的编译目录，保留staging_dir/toolchain（已安装的成果）
           rm -rf build_dir/toolchain-* build_dir/host build_dir/hostpkg
           df -hT /
 
@@ -157,7 +164,7 @@ jobs:
           RETRY_SUCCESS=true
           
           echo "===== 第一步：并行编译所有包（使用 $USE_CORES 核心） ====="
-          # 关键修复：不再执行 make package/clean，直接编译
+          # 关键：不再执行make package/clean，直接编译
           set -o pipefail
           if ! make package/compile -j$USE_CORES 2>&1 | tee package.log; then
             echo "===== 检测到包编译失败，开始串行精准重试 ====="
@@ -182,7 +189,6 @@ jobs:
               fi
             done
             
-            # 最终判断
             if [ "$RETRY_SUCCESS" = "false" ]; then
               echo "❌ 部分包重试失败，终止编译流程"
               exit 1
@@ -243,25 +249,25 @@ jobs:
             /workdir/istoreos/bin/targets/*/*/*.bin
             /workdir/istoreos/update_log.md
             /workdir/istoreos/*.log
-          retention-days: 30  # 建议30天，与清理策略一致
+          retention-days: 30
 
       # ===================== 步骤13：失败诊断（失败时执行）=====================
       - name: Failure Diagnostics
         if: failure()
         run: |
-          cd /workdir/istoreos
+          cd /workdir/istoreos 2>/dev/null || cd $GITHUB_WORKSPACE
           echo "::error::编译失败，开始收集诊断信息..."
           
           echo "===== 磁盘空间状态（检查是否因空间不足失败）====="
           df -hT /
           
           echo "===== 查找 config.log（通常是配置检测错误）====="
-          find build_dir -name "config.log" -type f -mmin -60 | head -5 | while read log; do
+          find build_dir -name "config.log" -type f -mmin -60 2>/dev/null | head -5 | while read log; do
             echo "--- $log ---"
             tail -30 "$log"
           done
           
-          echo "===== 检查 staging_dir 完整性（工具链是否安装成功）====="
+          echo "===== 检查 staging_dir 完整性 ====="
           ls -la staging_dir/toolchain-*/bin/ 2>/dev/null | head -5 || echo "⚠️ toolchain 可能未正确安装"
           
           echo "===== 最近错误摘要 ====="
@@ -277,13 +283,14 @@ jobs:
             /workdir/istoreos/build_dir/*/config.log
             /workdir/istoreos/*_error.log
             /workdir/istoreos/*_retry.log
-          retention-days: 7  # 失败调试信息保留短一点
+            /workdir/istoreos/*.log
+          retention-days: 7
 
       # ===================== 步骤15：清理旧Workflow记录（始终执行）=====================
       - name: Clean Old Workflow Runs
-        if: always()  # 关键：无论成功与否都执行清理
-        uses: Mattraks/delete-workflow-runs@v2.0.3  # 固定版本，修复安全风险
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2.0.3
         with:
-          retain_days: 30      # 与 artifact 保留期一致，节省存储
-          keep_minimum_runs: 4 # 至少保留4次（两次季度发布+余量）
+          retain_days: 30
+          keep_minimum_runs: 4
           github_token: ${{ secrets.GITHUB_TOKEN }}
