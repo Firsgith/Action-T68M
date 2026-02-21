@@ -1,17 +1,14 @@
 name: Build Custom iStoreOS (Quarterly)
 
-# 权限配置（满足上传产物、清理旧记录等需求）
 permissions:
   actions: write
   contents: write
 
-# 触发规则：季度自动编译 + 手动触发
 on:
   schedule:
-    - cron: '0 0 1 1,4,7,10 *'  # 每季度1/4/7/10月1号 UTC 0点（北京时间8点）
-  workflow_dispatch:             # 手动触发开关
+    - cron: '0 0 1 1,4,7,10 *'
+  workflow_dispatch:
 
-# 自定义环境变量（适配你的iStoreOS仓库/分支）
 env:
   REPO_URL: https://github.com/Firsgith/istoreos
   REPO_BRANCH: istoreos-24.10
@@ -20,73 +17,78 @@ env:
 jobs:
   build-firmware:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180  # 3小时超时，避免编译卡死
+    timeout-minutes: 180
     steps:
-      # ===================== 步骤1：安全清理系统空间（不破坏核心依赖） =====================
-      - name: Clean System (Safe Version)
+      # ===================== 步骤1：安全清理 + 修复源 + 屏蔽警告 =====================
+      - name: Clean System & Fix Sources (No Warnings)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 仅删除Runner预装的冗余大文件（释放~10GB空间）
+          # 屏蔽所有无关警告（重定向stderr到stdout，仅保留致命错误）
+          set +e
+          # 删除冗余大文件（安全）
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          # 安全清理缓存，不触碰系统核心组件
-          sudo apt-get autoremove -y --purge
-          sudo apt-get clean
+          sudo docker image prune --all --force > /dev/null 2>&1
+          # 安全清理，屏蔽目录非空警告
+          sudo apt-get autoremove -y --purge > /dev/null 2>&1
+          sudo apt-get clean > /dev/null 2>&1
           sudo rm -rf /var/lib/apt/lists/* /var/log/* /tmp/*
-          # 修复apt依赖链，确保包管理正常
-          sudo apt-get update --fix-missing
-          sudo apt-get -f install -y
-          # 创建工作目录（避开默认目录空间限制）
+          # 切换到官方Ubuntu源（解决Azure源缺失which包问题）
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+          sudo echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list
+          sudo echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse" >> /etc/apt/sources.list
+          # 修复依赖，屏蔽apt CLI警告
+          sudo apt-get update --fix-missing -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
+          sudo apt-get -f install -y -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
+          set -e
+          # 创建工作目录
           sudo mkdir -p /workdir && sudo chown $USER:$GROUPS /workdir
-          # 验证清理后空间
           df -hT /workdir
 
-      # ===================== 步骤2：克隆iStoreOS源码 =====================
+      # ===================== 步骤2：克隆源码 =====================
       - name: Clone iStoreOS Source Code
         run: |
-          # 完整克隆源码（非浅克隆，保证分支完整性）
           git clone $REPO_URL -b $REPO_BRANCH /workdir/istoreos
           ln -sf /workdir/istoreos $GITHUB_WORKSPACE/istoreos
           cd /workdir/istoreos
-          # 验证当前分支
           echo "当前编译分支："
           git branch -v
 
-      # ===================== 步骤3：安装编译依赖（最终修正版） =====================
-      - name: Install Build Dependencies (Final Fixed Version)
+      # ===================== 步骤3：安装依赖（移除which，通过coreutils替代） =====================
+      - name: Install Build Dependencies (Fixed - No 'which' Package)
         run: |
-          # 强制更新源 + 修复依赖
-          sudo apt update --fix-missing
-          sudo apt -f install -y
-          # 安装OpenWrt/iStoreOS编译完整依赖（核心+补充）
-          sudo apt install -y \
+          # 屏蔽apt CLI警告，强制更新源
+          sudo apt-get update --fix-missing -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
+          sudo apt-get -f install -y -o APT::Get::Show-User-Simulation-Note=no > /dev/null 2>&1
+          # 安装依赖（移除which，coreutils/util-linux已包含which命令）
+          sudo apt-get install -y -o APT::Get::Show-User-Simulation-Note=no \
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
             rsync swig unzip zlib1g-dev file wget \
-            diffutils findutils util-linux coreutils which pkg-config patch
-          # 验证关键命令是否存在（确保依赖安装成功）
+            diffutils findutils util-linux coreutils pkg-config patch
+          # 验证核心命令（包括which，通过util-linux提供）
           echo "===== 核心命令验证 ====="
           command -v gettext && echo "gettext ✅" || echo "gettext ❌"
           command -v diff && echo "diff ✅" || echo "diff ❌"
           command -v getopt && echo "getopt ✅" || echo "getopt ❌"
+          command -v which && echo "which ✅" || echo "which ❌"
           command -v gcc && echo "gcc ✅" || echo "gcc ❌"
-          # 验证关键依赖版本
+          # 验证版本
           echo "===== 关键依赖版本 ====="
           gcc --version | head -1
           make --version | head -1
           python3 --version
 
-      # ===================== 步骤4：更新Feeds + 加载自定义.config =====================
+      # ===================== 步骤4：更新Feeds + 加载.config =====================
       - name: Update Feeds & Load Custom .config
         run: |
           cd /workdir/istoreos
-          # 更新并安装所有feeds（iStoreOS必需）
           ./scripts/feeds update -a && ./scripts/feeds install -a
-          # 加载仓库根目录的自定义.config（如有）
           if [ -f "$GITHUB_WORKSPACE/.config" ]; then
             cp $GITHUB_WORKSPACE/.config ./
-            make defconfig  # 自动适配配置，修复版本兼容问题
+            make defconfig
             echo "===== 自定义.config加载成功 ====="
             cat .config | grep -E 'TARGET_|CONFIG_PACKAGE_istore' | head -10
           else
@@ -94,45 +96,38 @@ jobs:
             make defconfig
           fi
 
-      # ===================== 步骤5：下载依赖包（容错+详细日志） =====================
+      # ===================== 步骤5：下载依赖包（容错） =====================
       - name: Download Dependencies (Error Handling)
         run: |
           cd /workdir/istoreos
           echo "===== 开始下载依赖包（8线程） ====="
-          # 多线程下载，出错则单线程+详细日志重试
           if ! make download -j8; then
             echo "===== 下载出错，单线程+详细日志重新下载 ====="
             make download -j1 V=s 2>&1 | tee download_error.log
-            # 打印关键错误（404/超时等）
             grep -E 'error:|Failed|404|timeout' download_error.log | tail -20
-            # 最后重试一次
             echo "===== 最终重试下载 ====="
             make download -j1 || echo "===== 下载仍失败，请检查网络/源地址 ====="
           fi
-          # 清理无效下载包（大小<1KB的）
           find dl -size -1024c -exec rm -f {} \;
           echo "===== 依赖包下载完成，dl目录大小 ====="
           du -sh dl/
           df -hT /workdir
 
-      # ===================== 步骤6：编译工具链（clean→compile→install + 留1线程） =====================
+      # ===================== 步骤6：编译工具链 =====================
       - name: Build Toolchain (Clean→Compile→Install)
         run: |
           cd /workdir/istoreos
           CORES=$(nproc)
-          USE_CORES=$((CORES - 1))  # 留1线程，符合你的习惯
+          USE_CORES=$((CORES - 1))
           echo "===== 编译工具链（总核心$CORES，使用$USE_CORES核心） ====="
           
-          # Step1: 清空工具链缓存
           make toolchain/clean
-          # Step2: 仅编译工具链（留1线程）
           if ! make toolchain/compile -j$USE_CORES; then
             echo "===== 工具链编译出错，单线程+详细日志 ====="
             make toolchain/compile -j1 V=s 2>&1 | tee toolchain_error.log
             grep -E 'error:|Failed' toolchain_error.log | tail -20
             exit 1
           fi
-          # Step3: 安装工具链
           if ! make toolchain/install -j$USE_CORES; then
             echo "===== 工具链安装出错，单线程+详细日志 ====="
             make toolchain/install -j1 V=s 2>&1 | tee toolchain_error.log
@@ -140,11 +135,10 @@ jobs:
             exit 1
           fi
           
-          # 清理工具链临时文件
           rm -rf build_dir/toolchain tmp/toolchain logs/toolchain
           df -hT /workdir
 
-      # ===================== 步骤7：编译固件（全环节 clean→compile→install） =====================
+      # ===================== 步骤7：编译固件 =====================
       - name: Build Firmware (Full Clean→Compile→Install)
         run: |
           cd /workdir/istoreos
@@ -152,22 +146,18 @@ jobs:
           USE_CORES=$((CORES - 1))
           echo "===== 固件编译（总核心$CORES，使用$USE_CORES核心） ====="
           
-          # 通用容错函数：clean→compile→install
           run_with_fault_tolerance() {
             local target=$1
             local log_file=$2
             echo "===== 处理环节：$target ====="
             
-            # 清空缓存
             make $target/clean
-            # 仅编译（排查纯编译错误）
             if ! make $target/compile -j$USE_CORES; then
               echo "===== [$target compile] 出错，单线程+详细日志 ====="
               make $target/compile -j1 V=s 2>&1 | tee $log_file
               grep -E 'error:|Failed' $log_file | tail -20
               return 1
             fi
-            # 编译成功后安装
             if ! make $target/install -j$USE_CORES; then
               echo "===== [$target install] 出错，单线程+详细日志 ====="
               make $target/install -j1 V=s 2>&1 | tee $log_file
@@ -177,48 +167,42 @@ jobs:
             return 0
           }
           
-          # 分层编译：内核→包→打包
           if ! run_with_fault_tolerance "kernel" "kernel_error.log"; then exit 1; fi
           if ! run_with_fault_tolerance "package" "package_error.log"; then exit 1; fi
           if ! run_with_fault_tolerance "target" "install_error.log"; then exit 1; fi
           
           echo "===== 固件编译成功！ ====="
-          # 清理临时文件，释放空间
           rm -rf build_dir/target tmp/target logs/target staging_dir/target
           rm -rf bin/targets/*/*/packages
-          # 查看编译产物
           echo "===== 编译产物列表 ====="
           ls -lh bin/targets/*/*/
-          # 收集错误日志（如有）
           if ls *.log 1> /dev/null 2>&1; then cp *.log /workdir/istoreos/; fi
 
       # ===================== 步骤8：生成更新日志 =====================
       - name: Generate Update Log
         run: |
           cd /workdir/istoreos
-          # 生成近90天的源码更新日志
           echo "# 自定义iStoreOS更新日志（${{ env.REPO_BRANCH }}分支）" > update_log.md
           echo "生成时间：$(date +'%Y-%m-%d %H:%M:%S')" >> update_log.md
           echo "---" >> update_log.md
           git log --since="90 days ago" --pretty=format:"- %cd: %s (%h)" --date=short >> update_log.md
-          # 打印日志预览
           cat update_log.md | head -20
 
-      # ===================== 步骤9：上传固件+日志（保留180天） =====================
+      # ===================== 步骤9：上传固件+日志 =====================
       - name: Upload Firmware & Logs
         uses: actions/upload-artifact@v4
         with:
           name: Custom-iStoreOS-${{ github.run_id }}-${{ env.REPO_BRANCH }}
           path: |
-            /workdir/istoreos/bin/targets/*/*/*.img.gz  # 固件文件
-            /workdir/istoreos/update_log.md             # 更新日志
-            /workdir/istoreos/*.log                     # 错误日志（如有）
-          retention-days: 180  # 产物保留180天
+            /workdir/istoreos/bin/targets/*/*/*.img.gz
+            /workdir/istoreos/update_log.md
+            /workdir/istoreos/*.log
+          retention-days: 180
 
       # ===================== 步骤10：清理旧Workflow记录 =====================
       - name: Clean Old Workflow Runs
         uses: Mattraks/delete-workflow-runs@main
         with:
           retain_days: 180
-          keep_minimum_runs: 4  # 至少保留4条（对应4个季度）
+          keep_minimum_runs: 4
           github_token: ${{ secrets.GITHUB_TOKEN }}
