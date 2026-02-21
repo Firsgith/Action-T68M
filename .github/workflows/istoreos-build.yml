@@ -19,22 +19,21 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
-      # ===================== 步骤0：检出配置文件仓库（关键！）=====================
+      # ===================== 步骤0：检出配置文件仓库 =====================
       - name: Checkout Config Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # 获取完整历史，用于生成更新日志
 
-      # ===================== 步骤1：环境初始化 + 磁盘清理 =====================
+      # ===================== 步骤1：环境初始化 + 磁盘清理（保守版）=====================
       - name: Env Init & Disk Cleanup
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 系统清理（删除GitHub预装的臃肿软件，释放5-8GB空间）
-          # 注意：iscsid警告无害，可忽略
-          echo "===== 清理系统空间 ====="
+          # 优化：仅删除明确无风险的大文件，保留 AGENT_TOOLSDIRECTORY（Runner 核心工具目录）
+          echo "===== 清理系统空间（保守模式） ====="
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
-                      "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android /usr/local/share/chromedriver-linux64
+                      /usr/local/lib/android /usr/local/share/chromedriver-linux64
           docker rmi $(docker images -q) 2>/dev/null || true
           sudo apt-get remove -y --purge firefox google-chrome-stable microsoft-edge-stable 2>/dev/null || true
           
@@ -67,15 +66,9 @@ jobs:
           
           if [ -f "$CONFIG_SRC" ]; then
             cp -f "$CONFIG_SRC" "$CONFIG_DST"
-            echo "✅ 已加载自定义.config"
-            cat "$CONFIG_DST" | grep -E 'TARGET_|CONFIG_PACKAGE_istore' | head -10
-            # 展开配置（确保依赖完整）
-            cd /workdir/istoreos
-            make defconfig
+            echo "✅ 已加载自定义.config（将在Feeds更新后同步）"
           else
-            echo "⚠️ 未找到自定义.config，使用默认配置（请确保已将.config提交到GitHub仓库）"
-            cd /workdir/istoreos
-            make defconfig
+            echo "⚠️ 未找到自定义.config，使用默认配置（请确保已将.config提交到GitHub仓库根目录）"
           fi
 
       # ===================== 步骤4：安装编译依赖 =====================
@@ -97,7 +90,16 @@ jobs:
           cd /workdir/istoreos
           ./scripts/feeds update -a && ./scripts/feeds install -a
 
-      # ===================== 步骤6：下载依赖包 =====================
+      # ===================== 步骤6：同步配置（解决out of sync）=====================
+      - name: Sync Configuration
+        run: |
+          cd /workdir/istoreos
+          echo "===== 同步配置与最新Feeds ====="
+          # 使用 yes "" 自动回车选择默认值，避免交互式卡死
+          yes "" | make oldconfig
+          echo "✅ 配置已同步"
+
+      # ===================== 步骤7：下载依赖包 =====================
       - name: Download Dependencies
         run: |
           cd /workdir/istoreos
@@ -109,7 +111,7 @@ jobs:
           find dl -size -1024c -exec rm -f {} \;
           echo "===== 依赖包下载完成，dl目录大小：$(du -sh dl/) ====="
 
-      # ===================== 步骤7：编译工具链（修正：不clean，阶段后清理空间）=====================
+      # ===================== 步骤8：编译工具链 =====================
       - name: Build Toolchain
         run: |
           cd /workdir/istoreos
@@ -129,11 +131,13 @@ jobs:
           
           echo "===== 工具链完成，清理中间文件释放空间 ====="
           df -hT /
-          # 关键：只删build_dir中的编译目录，保留staging_dir/toolchain（已安装的成果）
-          rm -rf build_dir/toolchain-* build_dir/host build_dir/hostpkg
+          # 优化：增加存在性判断，避免通配符匹配不到时报错
+          for dir in build_dir/toolchain-* build_dir/host build_dir/hostpkg; do
+            [ -d "$dir" ] && rm -rf "$dir"
+          done
           df -hT /
 
-      # ===================== 步骤8：编译内核（修正：不clean）=====================
+      # ===================== 步骤9：编译内核 =====================
       - name: Build Kernel
         run: |
           cd /workdir/istoreos
@@ -152,10 +156,12 @@ jobs:
           set +o pipefail
           
           echo "===== 内核完成，清理中间文件 ====="
-          rm -rf build_dir/linux-* build_dir/target/linux
+          for dir in build_dir/linux-* build_dir/target/linux; do
+            [ -d "$dir" ] && rm -rf "$dir"
+          done
           df -hT /
 
-      # ===================== 步骤9：编译包（保留原版重试逻辑，修正clean问题）=====================
+      # ===================== 步骤10：编译包（含空值判断优化）=====================
       - name: Build Packages (Parallel + Serial Retry)
         run: |
           cd /workdir/istoreos
@@ -164,19 +170,26 @@ jobs:
           RETRY_SUCCESS=true
           
           echo "===== 第一步：并行编译所有包（使用 $USE_CORES 核心） ====="
-          # 关键：不再执行make package/clean，直接编译
           set -o pipefail
           if ! make package/compile -j$USE_CORES 2>&1 | tee package.log; then
             echo "===== 检测到包编译失败，开始串行精准重试 ====="
             
-            # 提取所有出错包（去重）- 保留原版逻辑
-            FAILED_PKGS=$(grep "ERROR: package/" package.log | awk -F'/' '{print $2}' | awk '{print $1}' | uniq)
+            # 优化：增加空值判断，避免循环执行空字符串；过滤空行
+            FAILED_PKGS=$(grep "ERROR: package/" package.log | awk -F'/' '{print $2}' | awk '{print $1}' | uniq | grep -v "^$")
+            
+            # 关键修复：如果未识别到具体包名，直接报错退出
+            if [ -z "$FAILED_PKGS" ]; then
+              echo "❌ 编译失败但未识别到具体包名，可能是系统错误或日志格式不匹配"
+              echo "===== 错误日志最后50行 ====="
+              tail -50 package.log
+              exit 1
+            fi
+            
             echo "需要重试的包列表：$FAILED_PKGS"
             
             # 逐个重试出错包
             for pkg in $FAILED_PKGS; do
               echo "===== 处理出错包：$pkg ====="
-              # 只clean特定失败的包，不是全部clean
               make package/$pkg/clean
               
               if ! make package/$pkg/compile -j1 V=s 2>&1 | tee ${pkg}_retry.log; then
@@ -202,10 +215,10 @@ jobs:
           set +o pipefail
           
           echo "===== 软件包完成，清理中间文件 ====="
-          rm -rf build_dir/package/*
+          [ -d "build_dir/package" ] && rm -rf build_dir/package/*
           df -hT /
 
-      # ===================== 步骤10：编译固件（修正：不clean）=====================
+      # ===================== 步骤11：编译固件 =====================
       - name: Build Final Firmware
         run: |
           cd /workdir/istoreos
@@ -224,12 +237,14 @@ jobs:
           set +o pipefail
           
           # 最终清理：只保留固件产物
-          rm -rf build_dir/target tmp/target staging_dir/target
+          for dir in build_dir/target tmp/target staging_dir/target; do
+            [ -d "$dir" ] && rm -rf "$dir"
+          done
           rm -rf bin/targets/*/*/packages
           echo "===== 编译产物列表 ====="
           ls -lh bin/targets/*/*/
 
-      # ===================== 步骤11：生成更新日志 =====================
+      # ===================== 步骤12：生成更新日志 =====================
       - name: Generate Update Log
         run: |
           cd /workdir/istoreos
@@ -238,7 +253,7 @@ jobs:
           echo "---" >> update_log.md
           git log --since="90 days ago" --pretty=format:"- %cd: %s (%h)" --date=short >> update_log.md
 
-      # ===================== 步骤12：上传固件+日志（成功时）=====================
+      # ===================== 步骤13：上传固件+日志（成功时）=====================
       - name: Upload Firmware & Logs
         if: success()
         uses: actions/upload-artifact@v4
@@ -251,17 +266,17 @@ jobs:
             /workdir/istoreos/*.log
           retention-days: 30
 
-      # ===================== 步骤13：失败诊断（失败时执行）=====================
+      # ===================== 步骤14：失败诊断（失败时执行）=====================
       - name: Failure Diagnostics
         if: failure()
         run: |
           cd /workdir/istoreos 2>/dev/null || cd $GITHUB_WORKSPACE
           echo "::error::编译失败，开始收集诊断信息..."
           
-          echo "===== 磁盘空间状态（检查是否因空间不足失败）====="
+          echo "===== 磁盘空间状态 ====="
           df -hT /
           
-          echo "===== 查找 config.log（通常是配置检测错误）====="
+          echo "===== 查找 config.log ====="
           find build_dir -name "config.log" -type f -mmin -60 2>/dev/null | head -5 | while read log; do
             echo "--- $log ---"
             tail -30 "$log"
@@ -273,7 +288,7 @@ jobs:
           echo "===== 最近错误摘要 ====="
           grep -h "error:" *.log 2>/dev/null | tail -10 || true
 
-      # ===================== 步骤14：上传失败现场（失败时）=====================
+      # ===================== 步骤15：上传失败现场（失败时）=====================
       - name: Upload Failure Debug Info
         if: failure()
         uses: actions/upload-artifact@v4
@@ -286,7 +301,7 @@ jobs:
             /workdir/istoreos/*.log
           retention-days: 7
 
-      # ===================== 步骤15：清理旧Workflow记录（始终执行）=====================
+      # ===================== 步骤16：清理旧Workflow记录（始终执行）=====================
       - name: Clean Old Workflow Runs
         if: always()
         uses: Mattraks/delete-workflow-runs@v2.0.3
