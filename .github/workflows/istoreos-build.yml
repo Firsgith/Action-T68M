@@ -89,19 +89,33 @@ jobs:
           make download -j8 2>&1 | tee download.log || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
+      # 关键修改：Toolchain编译增加单线程重试和详细错误输出
       - name: 编译工具链
         run: |
           cd /workdir/istoreos
           CORES=$(nproc)
+          
           if [ -d "staging_dir/toolchain-"* ] && [ -f "staging_dir/host/bin/mklibs" ]; then
             echo "Toolchain缓存命中，跳过编译"
           else
+            echo "===== 编译工具链（使用 $CORES 核心） ====="
             if ! make toolchain/compile -j$CORES 2>&1 | tee toolchain.log; then
-              make toolchain/compile -j1 V=s 2>&1 | tee toolchain_error.log
-              exit 1
+              echo "⚠️ 并行编译失败，尝试单线程详细输出..."
+              make toolchain/clean
+              if ! make toolchain/compile -j1 V=s 2>&1 | tee toolchain_error.log; then
+                echo "::error::Toolchain 编译失败"
+                echo "===== 错误日志最后100行 ====="
+                tail -100 toolchain_error.log
+                echo "===== 检查磁盘空间 ====="
+                df -h /
+                echo "===== 检查内存 ====="
+                free -h
+                exit 1
+              fi
             fi
             make toolchain/install -j$CORES
           fi
+          
           for dir in build_dir/toolchain-* build_dir/host build_dir/hostpkg; do
             [ -d "$dir" ] && rm -rf "$dir"
           done
@@ -155,8 +169,6 @@ jobs:
             [ -d "$dir" ] && rm -rf "$dir"
           done
           rm -rf bin/targets/*/*/packages
-          
-          echo "===== 生成的文件 ====="
           ls -lh bin/targets/*/*/
 
       - name: 生成日志
@@ -222,9 +234,10 @@ jobs:
           cd /workdir/istoreos 2>/dev/null || cd $GITHUB_WORKSPACE
           echo "::error::编译失败"
           df -hT /
+          free -h
           find build_dir -name "config.log" -type f -mmin -60 2>/dev/null | head -3 | while read log; do
             echo "--- $log ---"
-            tail -20 "$log"
+            tail -30 "$log"
           done
 
       - name: 清理历史记录
@@ -233,4 +246,4 @@ jobs:
         with:
           retain_days: 30
           keep_minimum_runs: 4
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}  # 修正：改为 token
