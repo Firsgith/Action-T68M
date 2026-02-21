@@ -1,0 +1,265 @@
+name: Image Builder 快速生成
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Image Builder 来源'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - artifact
+          - auto
+      version_tag:
+        description: '指定版本标签（留空使用最新）'
+        required: false
+        default: ''
+      extra_packages:
+        description: '额外添加的包（空格分隔）'
+        required: false
+        default: ''
+      remove_packages:
+        description: '要移除的包（空格分隔）'
+        required: false
+        default: ''
+      create_release:
+        description: '发布到 Release（长期保存）'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  PROFILE: lyt_t68m
+
+jobs:
+  quick-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: 检出配置
+        uses: actions/checkout@v4
+
+      - name: 检查包列表文件
+        run: |
+          if [ ! -f "$GITHUB_WORKSPACE/packages.txt" ]; then
+            echo "::error::未找到 packages.txt 文件"
+            echo ""
+            echo "请在仓库根目录创建 packages.txt，内容格式如下："
+            echo "========================================"
+            echo "# 系统基础"
+            echo "luci"
+            echo "luci-compat"
+            echo ""
+            echo "# 应用"
+            echo "luci-app-firewall"
+            echo "luci-app-diskman"
+            echo ""
+            echo "# 要移除的包前面加 -"
+            echo "-dnsmasq"
+            echo "+dnsmasq-full"
+            echo "========================================"
+            exit 1
+          fi
+          PKG_COUNT=$(grep -v '^#' $GITHUB_WORKSPACE/packages.txt | grep -v '^$' | wc -l)
+          echo "✅ 找到 packages.txt，包含 $PKG_COUNT 个软件包"
+
+      - name: 获取Image Builder
+        id: get_ib
+        run: |
+          mkdir -p ./download
+          cd ./download
+          
+          SOURCE="${{ github.event.inputs.source }}"
+          VERSION="${{ github.event.inputs.version_tag }}"
+          FALLBACK_MSG=""
+          
+          if [ "$SOURCE" = "release" ] || [ "$SOURCE" = "auto" ]; then
+            if [ -z "$VERSION" ]; then
+              echo "查询最新Release..."
+              VERSION=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name')
+            fi
+            
+            if [ "$VERSION" != "null" ] && [ -n "$VERSION" ]; then
+              echo "尝试从Release下载: $VERSION"
+              
+              ASSETS_JSON=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION")
+              ASSET_URL=$(echo "$ASSETS_JSON" | jq -r '.assets[] | select(.name | contains("imagebuilder")) | .browser_download_url' | head -1)
+              
+              if [ -n "$ASSET_URL" ] && [ "$ASSET_URL" != "null" ]; then
+                echo "找到Image Builder: $ASSET_URL"
+                if wget -q --timeout=60 "$ASSET_URL" -O imagebuilder.tar.xz; then
+                  echo "✅ 从Release下载成功"
+                  echo "SOURCE=release" >> $GITHUB_OUTPUT
+                  echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+                  exit 0
+                else
+                  echo "⚠️ 下载失败"
+                  [ "$SOURCE" = "release" ] && exit 1
+                fi
+              else
+                echo "⚠️ Release中未找到Image Builder文件"
+                [ "$SOURCE" = "release" ] && exit 1
+              fi
+            fi
+          fi
+          
+          if [ "$SOURCE" = "artifact" ] || [ "$SOURCE" = "auto" ]; then
+            echo "尝试从Artifact获取..."
+            FALLBACK_MSG="⚠️ 注意：使用Artifact（可能30天后过期）"
+            
+            RUNS_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-full.yml/runs?status=success&per_page=1")
+            RUN_ID=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].id')
+            
+            if [ "$RUN_ID" = "null" ] || [ -z "$RUN_ID" ]; then
+              echo "❌ 未找到可用的Artifact"
+              exit 1
+            fi
+            
+            echo "使用Artifact Run ID: $RUN_ID"
+            echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+            echo "SOURCE=artifact" >> $GITHUB_OUTPUT
+            echo "VERSION=artifact-${RUN_ID}" >> $GITHUB_OUTPUT
+            echo "FALLBACK_MSG=$FALLBACK_MSG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 下载Artifact
+        if: steps.get_ib.outputs.SOURCE == 'artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: Custom-iStoreOS-${{ steps.get_ib.outputs.RUN_ID }}
+          path: ./download
+
+      - name: 准备环境
+        run: |
+          cd ./download
+          
+          if [ "${{ steps.get_ib.outputs.SOURCE }}" = "artifact" ]; then
+            IB_FILE=$(find . -name "*imagebuilder*.tar.xz" -o -name "*imagebuilder*.tar.zst" | head -1)
+            if [ -n "$IB_FILE" ]; then
+              mv "$IB_FILE" imagebuilder.tar.xz
+            else
+              echo "❌ Artifact中未找到Image Builder文件"
+              exit 1
+            fi
+          fi
+          
+          tar xf imagebuilder.tar.xz
+          EXTRACTED_DIR=$(find . -maxdepth 1 -type d ! -name "." ! -name "download" | head -1)
+          
+          if [ -z "$EXTRACTED_DIR" ]; then
+            echo "❌ 解压后未找到目录"
+            exit 1
+          fi
+          
+          echo "解压目录: $EXTRACTED_DIR"
+          mv "$EXTRACTED_DIR" imagebuilder
+          
+          if [ ! -f "imagebuilder/Makefile" ]; then
+            echo "❌ Image Builder 结构不完整"
+            exit 1
+          fi
+          
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libncurses5-dev zlib1g-dev \
+            gawk git gettext libssl-dev xsltproc rsync wget unzip python3 file
+
+      - name: 生成固件
+        id: build
+        run: |
+          cd ./download/imagebuilder
+          
+          # 读取并去重基础包
+          BASE_PACKAGES=$(grep -v '^#' $GITHUB_WORKSPACE/packages.txt | grep -v '^$' | awk '!seen[$0]++' | tr '\n' ' ')
+          
+          # 处理包列表（去重+冲突解决）
+          REMOVE_PKGS="${{ github.event.inputs.remove_packages }}"
+          EXTRA_PKGS="${{ github.event.inputs.extra_packages }}"
+          
+          # 从基础包中过滤掉要移除的
+          FILTERED_BASE=""
+          for pkg in $BASE_PACKAGES; do
+            skip=false
+            for rem in $REMOVE_PKGS; do
+              [ "$pkg" = "$rem" ] && skip=true && break
+            done
+            $skip || FILTERED_BASE="$FILTERED_BASE $pkg"
+          done
+          
+          # 合并并整体去重
+          FINAL_PACKAGES=$(echo "$FILTERED_BASE $EXTRA_PKGS" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')
+          PKG_COUNT=$(echo "$FINAL_PACKAGES" | wc -w)
+          
+          # 设置输出供后续步骤使用
+          echo "pkg_count=$PKG_COUNT" >> $GITHUB_OUTPUT
+          
+          # 记录配置
+          echo "## 固件配置 $(date +%Y%m%d-%H%M)" > config.md
+          echo "- 设备: ${{ env.PROFILE }}" >> config.md
+          echo "- Image Builder来源: ${{ steps.get_ib.outputs.SOURCE }}" >> config.md
+          echo "- 基础版本: ${{ steps.get_ib.outputs.VERSION }}" >> config.md
+          echo "- 软件包数: $PKG_COUNT" >> config.md
+          [ -n "$REMOVE_PKGS" ] && echo "- 移除: $REMOVE_PKGS" >> config.md
+          [ -n "$EXTRA_PKGS" ] && echo "- 额外添加: $EXTRA_PKGS" >> config.md
+          
+          echo "=== 开始生成（共 $PKG_COUNT 个包）==="
+          
+          make image \
+            PROFILE=${{ env.PROFILE }} \
+            PACKAGES="$FINAL_PACKAGES" \
+            BIN_DIR=./output \
+            -j$(nproc) 2>&1 | tee build.log
+          
+          cd output
+          sha256sum *.img.gz > firmware.sha256
+          ls -lh
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.PROFILE }}-${{ github.run_id }}
+          path: |
+            ./download/imagebuilder/output/*.img.gz
+            ./download/imagebuilder/output/firmware.sha256
+            ./download/imagebuilder/config.md
+          retention-days: 14
+
+      - name: 发布到Release
+        if: success() && github.event.inputs.create_release == true
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: custom-${{ env.PROFILE }}-${{ github.run_number }}
+          name: 定制固件 ${{ env.PROFILE }} Build ${{ github.run_number }}
+          body: |
+            ## 定制固件信息
+            - **基础版本**: ${{ steps.get_ib.outputs.VERSION }}
+            - **Image Builder 来源**: ${{ steps.get_ib.outputs.SOURCE }}
+            - **设备型号**: ${{ env.PROFILE }}
+            - **软件包数**: ${{ steps.build.outputs.pkg_count }}
+            
+            ## 定制内容
+            - **额外添加**: ${{ github.event.inputs.extra_packages || '无' }}
+            - **移除**: ${{ github.event.inputs.remove_packages || '无' }}
+            
+            ## 使用说明
+            此固件基于 Image Builder 快速生成，适合特定需求场景。
+          files: |
+            ./download/imagebuilder/output/*.img.gz
+            ./download/imagebuilder/output/firmware.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建摘要
+        if: success()
+        run: |
+          echo "## ✅ 固件生成成功" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.get_ib.outputs.FALLBACK_MSG }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat ./download/imagebuilder/config.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.create_release }}" == "true" ]; then
+            echo "### 📦 已发布到 Release" >> $GITHUB_STEP_SUMMARY
+            echo "标签: custom-${{ env.PROFILE }}-${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          fi
