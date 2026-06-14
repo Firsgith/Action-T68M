@@ -35,35 +35,34 @@ env:
 
 jobs:
   quick-build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: 检出配置
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: 检查包列表文件
         run: |
           if [ ! -f "$GITHUB_WORKSPACE/packages.txt" ]; then
-            echo "::error::未找到 packages.txt 文件"
-            echo ""
-            echo "请在仓库根目录创建 packages.txt，内容格式如下："
-            echo "========================================"
-            echo "# 系统基础"
-            echo "luci"
-            echo "luci-compat"
-            echo ""
-            echo "# 应用"
-            echo "luci-app-firewall"
-            echo "luci-app-diskman"
-            echo ""
-            echo "# 要移除的包前面加 -"
-            echo "-dnsmasq"
-            echo "+dnsmasq-full"
-            echo "========================================"
-            exit 1
+            echo "⚠️ 未找到 packages.txt，使用默认包列表"
+            cat > "$GITHUB_WORKSPACE/packages.txt" << 'DEFAULT_PKGS'
+# 系统基础
+luci
+luci-compat
+luci-lib-ipkg
+
+# 网络应用
+luci-app-firewall
+luci-app-dockerman
+
+# 工具
+curl
+wget-ssl
+htop
+DEFAULT_PKGS
           fi
           PKG_COUNT=$(grep -v '^#' $GITHUB_WORKSPACE/packages.txt | grep -v '^$' | wc -l)
-          echo "✅ 找到 packages.txt，包含 $PKG_COUNT 个软件包"
+          echo "✅ 使用 packages.txt，包含 $PKG_COUNT 个软件包"
 
       - name: 获取Image Builder
         id: get_ib
@@ -110,7 +109,7 @@ jobs:
             FALLBACK_MSG="⚠️ 注意：使用Artifact（可能30天后过期）"
             
             RUNS_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-full.yml/runs?status=success&per_page=1")
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/istoreos-build.yml/runs?status=success&per_page=1")
             RUN_ID=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].id')
             
             if [ "$RUN_ID" = "null" ] || [ -z "$RUN_ID" ]; then
@@ -127,7 +126,7 @@ jobs:
 
       - name: 下载Artifact
         if: steps.get_ib.outputs.SOURCE == 'artifact'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: Custom-iStoreOS-${{ steps.get_ib.outputs.RUN_ID }}
           path: ./download
@@ -217,7 +216,7 @@ jobs:
           ls -lh
 
       - name: 上传固件
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: firmware-${{ env.PROFILE }}-${{ github.run_id }}
           path: |
@@ -228,10 +227,11 @@ jobs:
 
       - name: 发布到Release
         if: success() && github.event.inputs.create_release == true
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: custom-${{ env.PROFILE }}-${{ github.run_number }}
           name: 定制固件 ${{ env.PROFILE }} Build ${{ github.run_number }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           body: |
             ## 定制固件信息
             - **基础版本**: ${{ steps.get_ib.outputs.VERSION }}
@@ -248,8 +248,6 @@ jobs:
           files: |
             ./download/imagebuilder/output/*.img.gz
             ./download/imagebuilder/output/firmware.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 构建摘要
         if: success()
