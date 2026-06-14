@@ -6,7 +6,7 @@ on:
       source:
         description: 'Image Builder 来源'
         required: true
-        default: 'release'
+        default: 'auto'
         type: choice
         options:
           - release
@@ -69,6 +69,7 @@ jobs:
           VERSION="${{ github.event.inputs.version_tag }}"
           FALLBACK_MSG=""
           
+          # 尝试从Release下载
           if [ "$SOURCE" = "release" ] || [ "$SOURCE" = "auto" ]; then
             if [ -z "$VERSION" ]; then
               echo "查询最新Release..."
@@ -90,18 +91,25 @@ jobs:
                   exit 0
                 else
                   echo "下载失败"
-                  [ "$SOURCE" = "release" ] && exit 1
+                  if [ "$SOURCE" != "auto" ]; then
+                    exit 1
+                  fi
                 fi
               else
                 echo "Release中未找到Image Builder文件"
-                [ "$SOURCE" = "release" ] && exit 1
+                if [ "$SOURCE" != "auto" ]; then
+                  exit 1
+                fi
               fi
             else
               echo "未找到任何Release"
-              [ "$SOURCE" = "release" ] && exit 1
+              if [ "$SOURCE" != "auto" ]; then
+                exit 1
+              fi
             fi
           fi
           
+          # 尝试从Artifact下载
           if [ "$SOURCE" = "artifact" ] || [ "$SOURCE" = "auto" ]; then
             echo "尝试从Artifact获取..."
             FALLBACK_MSG="注意：使用Artifact（可能30天后过期）"
