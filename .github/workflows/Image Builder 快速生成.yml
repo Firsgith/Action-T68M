@@ -44,25 +44,20 @@ jobs:
       - name: 检查包列表文件
         run: |
           if [ ! -f "$GITHUB_WORKSPACE/packages.txt" ]; then
-            echo "⚠️ 未找到 packages.txt，使用默认包列表"
-            cat > "$GITHUB_WORKSPACE/packages.txt" << 'DEFAULT_PKGS'
-# 系统基础
-luci
-luci-compat
-luci-lib-ipkg
-
-# 网络应用
-luci-app-firewall
-luci-app-dockerman
-
-# 工具
-curl
-wget-ssl
-htop
-DEFAULT_PKGS
+            echo "未找到 packages.txt，使用默认包列表"
+            printf '%s\n' \
+              "luci" \
+              "luci-compat" \
+              "luci-lib-ipkg" \
+              "luci-app-firewall" \
+              "luci-app-dockerman" \
+              "curl" \
+              "wget-ssl" \
+              "htop" \
+              > "$GITHUB_WORKSPACE/packages.txt"
           fi
           PKG_COUNT=$(grep -v '^#' $GITHUB_WORKSPACE/packages.txt | grep -v '^$' | wc -l)
-          echo "✅ 使用 packages.txt，包含 $PKG_COUNT 个软件包"
+          echo "使用 packages.txt，包含 $PKG_COUNT 个软件包"
 
       - name: 获取Image Builder
         id: get_ib
@@ -89,16 +84,16 @@ DEFAULT_PKGS
               if [ -n "$ASSET_URL" ] && [ "$ASSET_URL" != "null" ]; then
                 echo "找到Image Builder: $ASSET_URL"
                 if wget -q --timeout=60 "$ASSET_URL" -O imagebuilder.tar.xz; then
-                  echo "✅ 从Release下载成功"
+                  echo "从Release下载成功"
                   echo "SOURCE=release" >> $GITHUB_OUTPUT
                   echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
                   exit 0
                 else
-                  echo "⚠️ 下载失败"
+                  echo "下载失败"
                   [ "$SOURCE" = "release" ] && exit 1
                 fi
               else
-                echo "⚠️ Release中未找到Image Builder文件"
+                echo "Release中未找到Image Builder文件"
                 [ "$SOURCE" = "release" ] && exit 1
               fi
             fi
@@ -106,14 +101,14 @@ DEFAULT_PKGS
           
           if [ "$SOURCE" = "artifact" ] || [ "$SOURCE" = "auto" ]; then
             echo "尝试从Artifact获取..."
-            FALLBACK_MSG="⚠️ 注意：使用Artifact（可能30天后过期）"
+            FALLBACK_MSG="注意：使用Artifact（可能30天后过期）"
             
             RUNS_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               "https://api.github.com/repos/${{ github.repository }}/actions/workflows/istoreos-build.yml/runs?status=success&per_page=1")
             RUN_ID=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].id')
             
             if [ "$RUN_ID" = "null" ] || [ -z "$RUN_ID" ]; then
-              echo "❌ 未找到可用的Artifact"
+              echo "未找到可用的Artifact"
               exit 1
             fi
             
@@ -140,7 +135,7 @@ DEFAULT_PKGS
             if [ -n "$IB_FILE" ]; then
               mv "$IB_FILE" imagebuilder.tar.xz
             else
-              echo "❌ Artifact中未找到Image Builder文件"
+              echo "Artifact中未找到Image Builder文件"
               exit 1
             fi
           fi
@@ -149,7 +144,7 @@ DEFAULT_PKGS
           EXTRACTED_DIR=$(find . -maxdepth 1 -type d ! -name "." ! -name "download" | head -1)
           
           if [ -z "$EXTRACTED_DIR" ]; then
-            echo "❌ 解压后未找到目录"
+            echo "解压后未找到目录"
             exit 1
           fi
           
@@ -157,7 +152,7 @@ DEFAULT_PKGS
           mv "$EXTRACTED_DIR" imagebuilder
           
           if [ ! -f "imagebuilder/Makefile" ]; then
-            echo "❌ Image Builder 结构不完整"
+            echo "Image Builder 结构不完整"
             exit 1
           fi
           
@@ -170,14 +165,11 @@ DEFAULT_PKGS
         run: |
           cd ./download/imagebuilder
           
-          # 读取并去重基础包
           BASE_PACKAGES=$(grep -v '^#' $GITHUB_WORKSPACE/packages.txt | grep -v '^$' | awk '!seen[$0]++' | tr '\n' ' ')
           
-          # 处理包列表（去重+冲突解决）
           REMOVE_PKGS="${{ github.event.inputs.remove_packages }}"
           EXTRA_PKGS="${{ github.event.inputs.extra_packages }}"
           
-          # 从基础包中过滤掉要移除的
           FILTERED_BASE=""
           for pkg in $BASE_PACKAGES; do
             skip=false
@@ -187,14 +179,11 @@ DEFAULT_PKGS
             $skip || FILTERED_BASE="$FILTERED_BASE $pkg"
           done
           
-          # 合并并整体去重
           FINAL_PACKAGES=$(echo "$FILTERED_BASE $EXTRA_PKGS" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')
           PKG_COUNT=$(echo "$FINAL_PACKAGES" | wc -w)
           
-          # 设置输出供后续步骤使用
           echo "pkg_count=$PKG_COUNT" >> $GITHUB_OUTPUT
           
-          # 记录配置
           echo "## 固件配置 $(date +%Y%m%d-%H%M)" > config.md
           echo "- 设备: ${{ env.PROFILE }}" >> config.md
           echo "- Image Builder来源: ${{ steps.get_ib.outputs.SOURCE }}" >> config.md
@@ -252,12 +241,12 @@ DEFAULT_PKGS
       - name: 构建摘要
         if: success()
         run: |
-          echo "## ✅ 固件生成成功" >> $GITHUB_STEP_SUMMARY
+          echo "## 固件生成成功" >> $GITHUB_STEP_SUMMARY
           echo "${{ steps.get_ib.outputs.FALLBACK_MSG }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           cat ./download/imagebuilder/config.md >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ github.event.inputs.create_release }}" == "true" ]; then
-            echo "### 📦 已发布到 Release" >> $GITHUB_STEP_SUMMARY
+            echo "### 已发布到 Release" >> $GITHUB_STEP_SUMMARY
             echo "标签: custom-${{ env.PROFILE }}-${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
           fi
