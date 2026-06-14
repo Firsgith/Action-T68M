@@ -16,11 +16,11 @@ env:
 
 jobs:
   build-firmware:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: 检出配置仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -72,7 +72,7 @@ jobs:
           yes "" | make oldconfig
 
       - name: 缓存Toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             /workdir/istoreos/staging_dir/toolchain-*
@@ -186,7 +186,7 @@ jobs:
 
       - name: 上传产物
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Custom-iStoreOS-${{ github.run_id }}
           path: |
@@ -213,18 +213,17 @@ jobs:
 
       - name: 发布Release
         if: success()
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.REPO_BRANCH }}-${{ github.run_number }}
           name: ${{ env.REPO_BRANCH }} Build ${{ github.run_number }}
           body_path: /workdir/istoreos/update_log.md
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             /workdir/istoreos/bin/targets/*/*/*.img.gz
             /workdir/istoreos/bin/targets/*/*/*imagebuilder*.tar.xz
             /workdir/istoreos/bin/targets/*/*/config.buildinfo
             /workdir/istoreos/bin/targets/*/*/sha256sums
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 失败诊断
         if: failure()
@@ -240,8 +239,8 @@ jobs:
 
       - name: 清理历史记录
         if: always()
-        uses: Mattraks/delete-workflow-runs@v2.0.3
+        uses: Mattraks/delete-workflow-runs@v2.1.0
         with:
           retain_days: 30
           keep_minimum_runs: 4
-          token: ${{ secrets.GITHUB_TOKEN }}  # 修正：改为 token
+          token: ${{ secrets.GITHUB_TOKEN }}
