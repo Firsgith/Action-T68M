@@ -96,6 +96,9 @@ jobs:
                 echo "Release中未找到Image Builder文件"
                 [ "$SOURCE" = "release" ] && exit 1
               fi
+            else
+              echo "未找到任何Release"
+              [ "$SOURCE" = "release" ] && exit 1
             fi
           fi
           
@@ -118,6 +121,12 @@ jobs:
             echo "VERSION=artifact-${RUN_ID}" >> $GITHUB_OUTPUT
             echo "FALLBACK_MSG=$FALLBACK_MSG" >> $GITHUB_OUTPUT
           fi
+          
+          # 最终检查：确保至少设置了SOURCE
+          if [ -z "$(grep 'SOURCE=' $GITHUB_OUTPUT 2>/dev/null)" ]; then
+            echo "::error::未能获取Image Builder，请先运行一次完整编译（istoreos-build.yml）生成Release或Artifact"
+            exit 1
+          fi
 
       - name: 下载Artifact
         if: steps.get_ib.outputs.SOURCE == 'artifact'
@@ -138,6 +147,12 @@ jobs:
               echo "Artifact中未找到Image Builder文件"
               exit 1
             fi
+          fi
+          
+          if [ ! -f "imagebuilder.tar.xz" ]; then
+            echo "::error::imagebuilder.tar.xz 不存在，无法解压"
+            ls -la ./download/
+            exit 1
           fi
           
           tar xf imagebuilder.tar.xz
